@@ -1,3 +1,4 @@
+
 using UnityEngine;
 using UnityEngine.Video;
 
@@ -5,213 +6,207 @@ using UnityEngine.Video;
 [DisallowMultipleComponent]
 public sealed class QuestAndroidVideoOutput : MonoBehaviour
 {
-    private const int MaxRenderTextureWidth = 1024;
-    private const float PlaybackStatusInterval = 3f;
-    private const float FirstFrameTimeout = 20f;
-
-    [SerializeField] private Material androidScreenMaterial;
+    [SerializeField]
+    private Material androidScreenMaterial;
 
     private VideoPlayer videoPlayer;
     private Renderer screenRenderer;
     private RenderTexture videoRenderTexture;
-    private Material originalMaterial;
     private Material runtimeMaterial;
-    private VideoRenderMode originalRenderMode;
-    private RenderTexture originalTargetTexture;
-    private bool originalPlayOnAwake;
-    private bool originalSendFrameReadyEvents;
+    private Material originalMaterial;
+
     private bool configured;
     private bool firstFrameDecoded;
-    private bool firstFrameTimeoutLogged;
-    private float prepareRequestedAt;
-    private float nextStatusLogAt;
-    private int statusLogCount;
+    private float startTime;
+    private float nextLogTime;
 
     private void Awake()
     {
+        // Preserve existing Windows and Editor behaviour.
         if (Application.platform != RuntimePlatform.Android)
-        {
             return;
-        }
 
         videoPlayer = GetComponent<VideoPlayer>();
         screenRenderer = GetComponent<Renderer>();
-        if (videoPlayer == null || screenRenderer == null || androidScreenMaterial == null ||
-            videoPlayer.clip == null || !androidScreenMaterial.HasProperty("_BaseMap"))
+
+        if (videoPlayer == null ||
+            screenRenderer == null ||
+            androidScreenMaterial == null ||
+            videoPlayer.clip == null)
         {
-            Debug.LogError(
-                "Quest TV output requires a VideoPlayer with a clip, a screen Renderer, and a URP material with _BaseMap.",
-                this);
-            enabled = false;
+            Debug.LogError("Quest TV: Missing required component, material or video clip.");
             return;
         }
 
         originalMaterial = screenRenderer.sharedMaterial;
-        originalRenderMode = videoPlayer.renderMode;
-        originalTargetTexture = videoPlayer.targetTexture;
-        originalPlayOnAwake = videoPlayer.playOnAwake;
-        originalSendFrameReadyEvents = videoPlayer.sendFrameReadyEvents;
-
-        videoRenderTexture = CreateRenderTexture(videoPlayer.clip);
-        if (videoRenderTexture == null)
-        {
-            Debug.LogError("Quest TV output could not create its video RenderTexture.", this);
-            enabled = false;
-            return;
-        }
-
-        runtimeMaterial = new Material(androidScreenMaterial)
-        {
-            name = androidScreenMaterial.name + " (Quest Runtime)"
-        };
-        runtimeMaterial.SetTexture("_BaseMap", videoRenderTexture);
 
         videoPlayer.playOnAwake = false;
         videoPlayer.Stop();
+
+        int width = 1280;
+        int height = 720;
+
+        if (videoPlayer.clip.width > 0 &&
+            videoPlayer.clip.height > 0)
+        {
+            width = Mathf.Min(
+                (int)videoPlayer.clip.width, 1280);
+
+            height = Mathf.Max(2, Mathf.RoundToInt(
+                width * (float)videoPlayer.clip.height /
+                videoPlayer.clip.width));
+        }
+
+        videoRenderTexture = new RenderTexture(
+            width,
+            height,
+            0,
+            RenderTextureFormat.ARGB32,
+            RenderTextureReadWrite.Default
+        );
+
+        videoRenderTexture.name = "Quest TV Render Texture";
+        videoRenderTexture.antiAliasing = 1;
+        videoRenderTexture.useMipMap = false;
+        videoRenderTexture.autoGenerateMips = false;
+        videoRenderTexture.filterMode = FilterMode.Bilinear;
+        videoRenderTexture.wrapMode = TextureWrapMode.Clamp;
+
+        if (!videoRenderTexture.Create())
+        {
+            Debug.LogError("Quest TV: Render Texture creation failed.");
+            return;
+        }
+
+        runtimeMaterial = new Material(androidScreenMaterial);
+
+        if (!runtimeMaterial.HasProperty("_BaseMap"))
+        {
+            Debug.LogError("Quest TV: Material has no Base Map.");
+            return;
+        }
+
+        runtimeMaterial.SetTexture(
+            "_BaseMap", videoRenderTexture);
+
+        if (runtimeMaterial.HasProperty("_BaseColor"))
+            runtimeMaterial.SetColor("_BaseColor", Color.white);
+
+        if (runtimeMaterial.HasProperty("_MainTex"))
+            runtimeMaterial.SetTexture(
+                "_MainTex", videoRenderTexture);
+
+        screenRenderer.sharedMaterial = runtimeMaterial;
+
+        ClearPropertyBlocks();
+
         videoPlayer.renderMode = VideoRenderMode.RenderTexture;
         videoPlayer.targetTexture = videoRenderTexture;
-        videoPlayer.prepareCompleted += OnPrepareCompleted;
-        videoPlayer.started += OnStarted;
-        videoPlayer.errorReceived += OnErrorReceived;
+        videoPlayer.isLooping = true;
+        videoPlayer.waitForFirstFrame = true;
+        videoPlayer.skipOnDrop = true;
+
+        videoPlayer.prepareCompleted += OnPrepared;
+        videoPlayer.errorReceived += OnVideoError;
         videoPlayer.frameReady += OnFrameReady;
         videoPlayer.sendFrameReadyEvents = true;
-        screenRenderer.sharedMaterial = runtimeMaterial;
+
         configured = true;
     }
 
     private void Start()
     {
-        if (configured)
+        if (!configured)
+            return;
+
+        startTime = Time.realtimeSinceStartup;
+        nextLogTime = startTime + 3f;
+
+        Debug.Log(
+            "Quest TV: Preparing video " +
+            videoPlayer.clip.name
+        );
+
+        videoPlayer.Prepare();
+    }
+
+    private void ClearPropertyBlocks()
+    {
+        screenRenderer.SetPropertyBlock(null);
+
+        for (int i = 0;
+             i < screenRenderer.sharedMaterials.Length;
+             i++)
         {
-            prepareRequestedAt = Time.realtimeSinceStartup;
-            Debug.Log(
-                $"Preparing Quest TV clip '{videoPlayer.clip.name}' " +
-                $"({videoPlayer.clip.width}x{videoPlayer.clip.height}, " +
-                $"{videoPlayer.clip.audioTrackCount} audio tracks).",
-                this);
-            videoPlayer.Prepare();
+            screenRenderer.SetPropertyBlock(null, i);
         }
+    }
+
+    private void OnPrepared(VideoPlayer source)
+    {
+        ClearPropertyBlocks();
+
+        source.targetTexture = videoRenderTexture;
+
+        runtimeMaterial.SetTexture(
+            "_BaseMap", videoRenderTexture);
+
+        Debug.Log("Quest TV: Video prepared successfully.");
+
+        source.Play();
+    }
+
+    private void OnFrameReady(
+        VideoPlayer source, long frameIndex)
+    {
+        if (firstFrameDecoded)
+            return;
+
+        firstFrameDecoded = true;
+
+        ClearPropertyBlocks();
+
+        runtimeMaterial.SetTexture(
+            "_BaseMap", videoRenderTexture);
+
+        Debug.Log(
+            "Quest TV: First frame decoded: " +
+            frameIndex
+        );
+
+        source.sendFrameReadyEvents = false;
+    }
+
+    private void OnVideoError(
+        VideoPlayer source, string message)
+    {
+        Debug.LogError("Quest TV VIDEO ERROR: " + message);
     }
 
     private void Update()
     {
         if (!configured || firstFrameDecoded)
-        {
             return;
-        }
 
-        float elapsed = Time.realtimeSinceStartup - prepareRequestedAt;
-        if (statusLogCount < 7 && elapsed >= nextStatusLogAt)
+        if (Time.realtimeSinceStartup >= nextLogTime)
         {
-            statusLogCount++;
-            nextStatusLogAt = elapsed + PlaybackStatusInterval;
+            nextLogTime = Time.realtimeSinceStartup + 3f;
+
             Debug.Log(
-                $"Quest TV state at {elapsed:F1}s: prepared={videoPlayer.isPrepared}, " +
-                $"playing={videoPlayer.isPlaying}, frame={videoPlayer.frame}, " +
-                $"time={videoPlayer.time:F2}s, renderMode={videoPlayer.renderMode}, " +
-                $"targetMatches={videoPlayer.targetTexture == videoRenderTexture}, " +
-                $"screenMaterialMatches={screenRenderer.sharedMaterial == runtimeMaterial}.",
-                this);
+                "Quest TV: Prepared=" +
+                videoPlayer.isPrepared +
+                " Playing=" + videoPlayer.isPlaying +
+                " Frame=" + videoPlayer.frame
+            );
         }
 
-        if (!firstFrameTimeoutLogged && elapsed >= FirstFrameTimeout)
+        if (Time.realtimeSinceStartup - startTime > 20f)
         {
-            firstFrameTimeoutLogged = true;
             Debug.LogError(
-                $"Quest TV has not decoded a frame after {FirstFrameTimeout:F0}s. " +
-                $"prepared={videoPlayer.isPrepared}, playing={videoPlayer.isPlaying}, " +
-                $"frame={videoPlayer.frame}, time={videoPlayer.time:F2}s.",
-                this);
-        }
-    }
+                "Quest TV: No video frame after 20 seconds."
+            );
 
-    private RenderTexture CreateRenderTexture(VideoClip clip)
-    {
-        uint sourceWidth = clip.width;
-        uint sourceHeight = clip.height;
-        int width = sourceWidth == 0u
-            ? MaxRenderTextureWidth
-            : sourceWidth > MaxRenderTextureWidth
-                ? MaxRenderTextureWidth
-                : (int)sourceWidth;
-        int height = sourceWidth != 0u && sourceHeight != 0u
-            ? Mathf.RoundToInt(width * (float)sourceHeight / sourceWidth)
-            : 576;
-        height = Mathf.Clamp(height, 144, 1024);
-
-        var target = new RenderTexture(
-            width,
-            height,
-            0,
-            RenderTextureFormat.ARGB32,
-            RenderTextureReadWrite.sRGB)
-        {
-            name = "Quest TV Video Frame",
-            antiAliasing = 1,
-            useMipMap = false,
-            autoGenerateMips = false,
-            filterMode = FilterMode.Bilinear,
-            wrapMode = TextureWrapMode.Clamp
-        };
-
-        if (target.Create())
-        {
-            return target;
-        }
-
-        Destroy(target);
-        return null;
-    }
-
-    private void OnPrepareCompleted(VideoPlayer source)
-    {
-        if (source != videoPlayer)
-        {
-            return;
-        }
-
-        Debug.Log(
-            $"Quest TV clip prepared ({source.width}x{source.height}, " +
-            $"isPrepared={source.isPrepared}); starting playback.",
-            this);
-        source.Play();
-    }
-
-    private void OnStarted(VideoPlayer source)
-    {
-        if (source == videoPlayer)
-        {
-            Debug.Log(
-                $"Quest TV playback started: isPlaying={source.isPlaying}, " +
-                $"isPrepared={source.isPrepared}, frame={source.frame}, time={source.time:F2}s.",
-                this);
-        }
-    }
-
-    private void OnFrameReady(VideoPlayer source, long frameIndex)
-    {
-        if (source != videoPlayer || firstFrameDecoded)
-        {
-            return;
-        }
-
-        firstFrameDecoded = true;
-        source.frameReady -= OnFrameReady;
-        source.sendFrameReadyEvents = originalSendFrameReadyEvents;
-        string outputSize = source.targetTexture != null
-            ? $"{source.targetTexture.width}x{source.targetTexture.height}"
-            : "none";
-        Debug.Log(
-            $"Quest TV decoded first frame {frameIndex}; playback={source.isPlaying}, " +
-            $"time={source.time:F2}s, output={outputSize}.",
-            this);
-    }
-
-    private void OnErrorReceived(VideoPlayer source, string message)
-    {
-        if (source == videoPlayer)
-        {
-            Debug.LogError($"Quest TV playback error: {message}", this);
+            enabled = false;
         }
     }
 
@@ -219,35 +214,27 @@ public sealed class QuestAndroidVideoOutput : MonoBehaviour
     {
         if (videoPlayer != null)
         {
-            videoPlayer.prepareCompleted -= OnPrepareCompleted;
-            videoPlayer.started -= OnStarted;
-            videoPlayer.errorReceived -= OnErrorReceived;
+            videoPlayer.prepareCompleted -= OnPrepared;
+            videoPlayer.errorReceived -= OnVideoError;
             videoPlayer.frameReady -= OnFrameReady;
-            if (configured)
+
+            if (videoPlayer.targetTexture == videoRenderTexture)
             {
-                videoPlayer.sendFrameReadyEvents = originalSendFrameReadyEvents;
                 videoPlayer.Stop();
-                videoPlayer.renderMode = originalRenderMode;
-                videoPlayer.targetTexture = originalTargetTexture;
-                videoPlayer.playOnAwake = originalPlayOnAwake;
+                videoPlayer.targetTexture = null;
             }
         }
 
-        if (screenRenderer != null && runtimeMaterial != null &&
-            screenRenderer.sharedMaterial == runtimeMaterial)
-        {
+        if (screenRenderer != null && originalMaterial != null)
             screenRenderer.sharedMaterial = originalMaterial;
-        }
-
-        if (runtimeMaterial != null)
-        {
-            Destroy(runtimeMaterial);
-        }
 
         if (videoRenderTexture != null)
         {
             videoRenderTexture.Release();
             Destroy(videoRenderTexture);
         }
+
+        if (runtimeMaterial != null)
+            Destroy(runtimeMaterial);
     }
 }
